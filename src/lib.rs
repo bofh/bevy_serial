@@ -134,11 +134,12 @@
 //! - MIT
 //! - Apache 2.0
 
-
 pub use mio_serial::{DataBits, FlowControl, Parity, StopBits};
 
-use bevy::app::{App, CoreStage, EventReader, EventWriter, Plugin};
-use bevy::ecs::system::{Res, ResMut};
+use bevy::app::{App, CoreSet, Plugin};
+use bevy::ecs::event::{EventReader, EventWriter};
+use bevy::ecs::system::{Res, ResMut, Resource};
+use bevy::prelude::IntoSystemConfig;
 use mio::{Events, Interest, Poll, Token};
 use mio_serial::SerialStream;
 use once_cell::sync::OnceCell;
@@ -219,15 +220,26 @@ struct SerialStreamLabeled {
 static SERIALS: OnceCell<Vec<Mutex<SerialStreamLabeled>>> = OnceCell::new();
 
 /// Component to get an index of serial port based on the label
+#[derive(Resource, Default, Debug)]
 struct Indices(HashMap<String, usize>);
+
+#[derive(Resource)]
+struct PollRes(Poll);
+
+#[derive(Resource)]
+struct EventsRes(Events);
 
 /// The size of read buffer for one read system call
 const DEFAULT_READ_BUFFER_LEN: usize = 2048;
 
 impl Plugin for SerialPlugin {
     fn build(&self, app: &mut App) {
-        let poll = Poll::new().unwrap();
-        let events = Events::with_capacity(self.settings.len());
+        let poll = PollRes {
+            0: Poll::new().unwrap(),
+        };
+        let events = EventsRes {
+            0: Events::with_capacity(self.settings.len()),
+        };
         let mut serials: Vec<Mutex<SerialStreamLabeled>> = vec![];
         let mut indices = Indices(HashMap::new());
 
@@ -246,7 +258,8 @@ impl Plugin for SerialPlugin {
             });
 
             // token index is same as index of vec
-            poll.registry()
+            poll.0
+                .registry()
                 .register(&mut stream, Token(i), Interest::READABLE)
                 .unwrap_or_else(|e| {
                     panic!("Failed to register stream to poll : {:?}", e);
@@ -279,8 +292,8 @@ impl Plugin for SerialPlugin {
             .insert_resource(indices)
             .add_event::<SerialReadEvent>()
             .add_event::<SerialWriteEvent>()
-            .add_system_to_stage(CoreStage::PreUpdate, read_serial)
-            .add_system_to_stage(CoreStage::PostUpdate, write_serial);
+            .add_system(read_serial.in_base_set(CoreSet::PreUpdate))
+            .add_system(write_serial.in_base_set(CoreSet::PostUpdate));
     }
 }
 
@@ -288,19 +301,20 @@ impl Plugin for SerialPlugin {
 /// If any data has come to serial, `SerialReadEvent` is sent to the system subscribing it.
 fn read_serial(
     mut ev_receive_serial: EventWriter<SerialReadEvent>,
-    mut poll: ResMut<Poll>,
-    mut events: ResMut<Events>,
+    mut poll: ResMut<PollRes>,
+    mut events: ResMut<EventsRes>,
     indices: Res<Indices>,
 ) {
     if !indices.0.is_empty() {
         // poll serial read event (should timeout not to block other systems)
-        poll.poll(&mut events, Some(Duration::from_micros(1)))
+        poll.0
+            .poll(&mut events.0, Some(Duration::from_micros(1)))
             .unwrap_or_else(|e| {
                 panic!("Failed to poll events: {:?}", e);
             });
 
         // if events have occurred, send `SerialReadEvent` with serial labels and read data buffer
-        for event in events.iter() {
+        for event in events.0.iter() {
             // get serial instance based on the token index
             let serials = SERIALS.get().expect("SERIALS are not initialized");
             let serial_mtx = serials
